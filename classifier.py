@@ -36,6 +36,9 @@ from imblearn.over_sampling import RandomOverSampler as ROS # training data over
 from sklearn.model_selection import train_test_split # splitting dataframes
 from torch.utils.data import Dataset, DataLoader # data pipeline
 
+from pydicom import dcmread
+from PIL import Image
+
 # setting gpu
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -103,12 +106,12 @@ print(f"Number of labels: {len(image_labels)}")
 
 # Load the DeiT model
 import timm
+import time
 
 # Load the models
 models_list = [
-    
-    ('ViT', timm.create_model('vit_base_patch16_224', pretrained=True)),
     ('ResNet', models.resnet18(pretrained=True)),
+    ('ViT', timm.create_model('vit_base_patch16_224', pretrained=True)),
     ('DEiT', timm.create_model('deit_small_patch16_224', pretrained=True))
 ]
 
@@ -119,24 +122,21 @@ print("Label numbers associated with each class weight:")
 for label, weight in zip(range(len(label_counts)), class_weights):
     print(f"Label {label}: {weight.item()}")
 criterion = nn.CrossEntropyLoss(weight=class_weights)
-optimizer = optim.Adam(model.parameters(), lr=0.001)
+
 
 # Define the data augmentation
 transform = T.Compose([
-    T.Resize((100, 100)),
-    T.RandomHorizontalFlip(),
-    T.RandomVerticalFlip(),
-    T.RandomRotation(20),
+    T.Resize((224, 224)), # Resize the image to 224x224
+    T.Grayscale(num_output_channels=3),  # Convert the image to RGB
     T.ToTensor(),
-    T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    T.Normalize((0.5,), (0.5,))  # Use single-channel normalization
 ])
 
 # Define the dataset
 class SunnyBrookDataset(Dataset):
-    def __init__(self, image_ids, image_labels, image_dir, transform=None):
+    def __init__(self, image_ids, image_labels, transform=None):
         self.image_ids = image_ids
         self.image_labels = image_labels
-        self.image_dir = image_dir
         self.transform = transform
 
     def __len__(self):
@@ -144,8 +144,9 @@ class SunnyBrookDataset(Dataset):
 
     def __getitem__(self, idx):
         image_id = self.image_ids[idx]
-        image_file = os.path.join(self.image_dir, image_id)
-        image = Image.open(image_file)
+        dicom = dcmread(image_id)
+        image = Image.fromarray(dicom.pixel_array)  # Convert DICOM data to a PIL Image
+        image = image.convert("F")  # Convert the image to float
         label = self.image_labels[idx]
 
         if self.transform:
@@ -157,24 +158,32 @@ class SunnyBrookDataset(Dataset):
 train_image_ids, val_image_ids, train_image_labels, val_image_labels = train_test_split(image_files, image_labels, test_size=0.2, stratify=image_labels, random_state=RANDOM_SEED)
 
 # Create the training and validation datasets
-train_dataset = SunnyBrookDataset(train_image_ids, train_image_labels, image_dir, transform=transform)
-val_dataset = SunnyBrookDataset(val_image_ids, val_image_labels, image_dir, transform=transform)
+train_dataset = SunnyBrookDataset(train_image_ids, train_image_labels, transform=transform)
+val_dataset = SunnyBrookDataset(val_image_ids, val_image_labels, transform=transform)
 
 # Create the training and validation dataloaders
 train_dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True)
 val_dataloader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+
+for model_name, model in models_list:
+    if model_name == 'ResNet':
+        model.fc = nn.Linear(in_features=model.fc.in_features, out_features=4, bias=True)
+    else:  # ViT and DEiT
+        model.head = nn.Linear(in_features=model.head.in_features, out_features=4, bias=True)
+
 
 # Train and evaluate the models
 for model_name, model in models_list:
     NUM_EPOCHS = 10
     
     print(f"Training {model_name} model...")
-    model.head = nn.Linear(in_features=384, out_features=4, bias=True)
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
     model = model.to(DEVICE)
 
     # Define the optimizer here
     optimizer = optim.Adam(model.parameters(), lr=0.001)
 
+    start_time = time.time()
     for epoch in range(NUM_EPOCHS):
         model.train()
         running_loss = 0.0
@@ -188,3 +197,23 @@ for model_name, model in models_list:
             optimizer.step()
             running_loss += loss.item()
         print(f"Epoch {epoch+1}, loss: {running_loss/len(train_dataloader)}")
+    
+    end_time = time.time()
+    training_time = end_time - start_time
+    print(f"Training {model_name} model completed in {training_time} seconds.")
+    
+    # Evaluation metrics
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for images, labels in val_dataloader:
+            images = images.to(DEVICE)
+            labels = labels.to(DEVICE)
+            outputs = model(images)
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+    
+    accuracy = correct / total
+    print(f"Validation accuracy for {model_name} model: {accuracy}")
